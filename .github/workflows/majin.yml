@@ -10,10 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        submodules: false
       
     - name: Setup Android environment
       run: |
@@ -32,10 +30,10 @@ jobs:
     - name: Start Android emulator
       run: |
         # 下载并启动安卓模拟器
-        wget https://github.com/remote-android/redroid-actions/raw/master/start-redroid.sh
+        wget -q https://github.com/remote-android/redroid-actions/raw/master/start-redroid.sh
         chmod +x start-redroid.sh
         ./start-redroid.sh &
-        sleep 30
+        sleep 60
         
         # 检查设备连接
         adb devices
@@ -44,158 +42,215 @@ jobs:
         
     - name: Download and extract XAPK
       run: |
-        # 下载Blue Archive XAPK文件
+        echo "开始下载Blue Archive XAPK文件..."
         wget -O bluearchive.xapk "https://d.apkpure.com/b/XAPK/com.YostarJP.BlueArchive?nc=arm64-v8a&sv=24"
         
-        # 解压XAPK文件
-        unzip -o bluearchive.xapk -d xapk_extracted
-        
-        # 查看文件结构
-        echo "=== XAPK文件结构 ==="
-        find xapk_extracted -type f -name "*.apk" | sort
-        
-        # 安装主APK和分割APK
-        echo "=== 开始安装APK文件 ==="
-        
-        # 先安装主APK
-        if [ -f "xapk_extracted/com.YostarJP.BlueArchive.xapk" ]; then
-          unzip -o xapk_extracted/com.YostarJP.BlueArchive.xapk -d final_extracted
-        else
-          cp -r xapk_extracted/ final_extracted/
+        if [ ! -f "bluearchive.xapk" ]; then
+          echo "下载失败，尝试备用下载源"
+          # 备用下载方法
+          curl -L -o bluearchive.xapk "https://d.apkpure.com/b/XAPK/com.YostarJP.BlueArchive?nc=arm64-v8a&sv=24"
         fi
         
-        # 安装所有APK文件
+        echo "解压XAPK文件..."
+        mkdir -p xapk_extracted
+        unzip -o bluearchive.xapk -d xapk_extracted || echo "解压可能有问题，继续处理..."
+        
+        echo "=== XAPK文件结构 ==="
+        find xapk_extracted -type f | sort
+        
+        # 查找APK文件
+        mkdir -p final_extracted
+        find xapk_extracted -name "*.apk" -exec cp {} final_extracted/ \;
+        
+        echo "找到的APK文件:"
+        ls -la final_extracted/
+        
+        # 安装APK文件
         for apk in final_extracted/*.apk; do
           if [ -f "$apk" ]; then
-            echo "安装: $apk"
-            adb install -r "$apk"
+            echo "安装: $(basename $apk)"
+            adb install -r "$apk" || adb install "$apk"
           fi
         done
         
         # 检查安装结果
-        adb shell pm list packages | grep yostarjp
+        echo "安装的包:"
+        adb shell pm list packages | grep -i bluearchive || adb shell pm list packages | grep -i yostar
         
     - name: Setup Frida server
       run: |
-        # 下载并安装frida-server
+        echo "设置Frida..."
+        # 下载frida-server (使用x86_64版本，因为GitHub Actions是x86架构)
         wget -q https://github.com/frida/frida/releases/download/16.1.8/frida-server-16.1.8-android-x86_64.xz
-        unxz frida-server-16.1.8-android-x86_64.xz
+        xz -d frida-server-16.1.8-android-x86_64.xz || unxz frida-server-16.1.8-android-x86_64.xz
         adb push frida-server-16.1.8-android-x86_64 /data/local/tmp/frida-server
         adb shell "chmod 755 /data/local/tmp/frida-server"
         adb shell "nohup /data/local/tmp/frida-server > /dev/null 2>&1 &"
         
+        # 等待frida启动
+        sleep 10
+        
         # 检查frida是否运行
-        sleep 5
-        adb shell "ps | grep frida-server"
+        echo "检查Frida状态:"
+        adb shell "ps | grep frida" || echo "Frida进程可能未找到，继续..."
+        
+        # 安装frida-tools
+        pip3 install frida-tools
         
     - name: Create hook script
       run: |
         cat > hook_bluearchive.js << 'EOF'
         console.log("[+] Blue Archive Hook脚本加载完成");
 
-        // 等待游戏加载
-        setTimeout(function() {
-            Java.perform(function() {
-                console.log("[+] 开始Hook目标类...");
-                
+        Java.perform(function() {
+            console.log("[+] Java环境准备就绪");
+            
+            // 等待类加载
+            setTimeout(function() {
                 try {
+                    console.log("[+] 尝试Hook目标类...");
+                    
                     // Hook QueuingGetCryptoKeysResponse类
                     var targetClass = Java.use("MX.NetworkProtocol.QueuingGetCryptoKeysResponse");
-                    console.log("[+] 找到目标类: MX.NetworkProtocol.QueuingGetCryptoKeysResponse");
+                    console.log("[+] 成功找到目标类");
                     
-                    // Hook EncryptedSqlCipherLicense setter
+                    // Hook EncryptedSqlCipherLicense
                     targetClass.set_EncryptedSqlCipherLicense.implementation = function(value) {
-                        console.log("\n=== HOOK EncryptedSqlCipherLicense ===");
+                        console.log("\n🎯 HOOK捕获 - EncryptedSqlCipherLicense");
                         console.log("值: " + value);
+                        console.log("类型: " + typeof value);
                         console.log("长度: " + (value ? value.length : 0));
                         
                         // 保存到文件
-                        var file = new File("/sdcard/encrypted_license.txt", "w");
-                        file.write(value);
-                        file.flush();
-                        file.close();
+                        var File = Java.use("java.io.File");
+                        var FileWriter = Java.use("java.io.FileWriter");
+                        
+                        try {
+                            var file = File.$new("/sdcard/encrypted_license.txt");
+                            var fw = FileWriter.$new(file);
+                            fw.write(value);
+                            fw.close();
+                            console.log("✅ License已保存到文件");
+                        } catch (e) {
+                            console.log("❌ 保存文件失败: " + e);
+                        }
                         
                         return this.set_EncryptedSqlCipherLicense(value);
                     };
                     
-                    // Hook EncryptedSqlCipherKey setter
+                    // Hook EncryptedSqlCipherKey
                     targetClass.set_EncryptedSqlCipherKey.implementation = function(value) {
-                        console.log("\n=== HOOK EncryptedSqlCipherKey ===");
+                        console.log("\n🎯 HOOK捕获 - EncryptedSqlCipherKey");
                         console.log("值: " + value);
+                        console.log("类型: " + typeof value);
                         console.log("长度: " + (value ? value.length : 0));
                         
                         // 保存到文件
-                        var file = new File("/sdcard/encrypted_key.txt", "w");
-                        file.write(value);
-                        file.flush();
-                        file.close();
+                        var File = Java.use("java.io.File");
+                        var FileWriter = Java.use("java.io.FileWriter");
+                        
+                        try {
+                            var file = File.$new("/sdcard/encrypted_key.txt");
+                            var fw = FileWriter.$new(file);
+                            fw.write(value);
+                            fw.close();
+                            console.log("✅ Key已保存到文件");
+                        } catch (e) {
+                            console.log("❌ 保存文件失败: " + e);
+                        }
                         
                         return this.set_EncryptedSqlCipherKey(value);
                     };
                     
-                    // 也hook getter方法
-                    targetClass.get_EncryptedSqlCipherLicense.implementation = function() {
-                        var result = this.get_EncryptedSqlCipherLicense();
-                        console.log("[GET] EncryptedSqlCipherLicense被读取");
-                        return result;
-                    };
-                    
-                    targetClass.get_EncryptedSqlCipherKey.implementation = function() {
-                        var result = this.get_EncryptedSqlCipherKey();
-                        console.log("[GET] EncryptedSqlCipherKey被读取");
-                        return result;
-                    };
-                    
-                    console.log("[+] Hook设置完成，等待游戏触发...");
+                    console.log("[+] ✅ Hook设置完成，等待游戏触发...");
                     
                 } catch (e) {
-                    console.log("[-] Hook错误: " + e);
+                    console.log("[-] ❌ Hook错误: " + e);
+                    console.log("[-] 堆栈: " + e.stack);
                 }
-            });
-        }, 10000); // 等待10秒让游戏加载
+            }, 5000);
+        });
+        
+        // 监控游戏启动
+        Java.choose("com.yostarjp.bluearchive.MxUnityPlayerActivity", {
+            onMatch: function(instance) {
+                console.log("[+] 游戏Activity已启动: " + instance);
+            },
+            onComplete: function() {
+                console.log("[+] Activity搜索完成");
+            }
+        });
         EOF
+        
+        echo "Hook脚本创建完成"
         
     - name: Start game and run hook
       run: |
-        # 启动游戏
         echo "启动游戏..."
+        # 启动游戏Activity
         adb shell am start -n com.yostarjp.bluearchive/com.yostarjp.bluearchive.MxUnityPlayerActivity
         
         # 等待游戏启动
-        sleep 15
+        echo "等待游戏启动..."
+        sleep 30
         
-        # 运行Frida hook
+        # 检查游戏进程
+        echo "运行中的进程:"
+        adb shell "ps | grep bluearchive" || echo "游戏进程未找到"
+        
+        # 运行Frida hook (超时5分钟)
         echo "启动Frida Hook..."
-        timeout 300 frida -U -l hook_bluearchive.js -f com.yostarjp.bluearchive --no-pause || echo "Frida执行完成或超时"
+        timeout 300 frida -U -l hook_bluearchive.js -f com.yostarjp.bluearchive --no-pause --runtime=v8 || echo "Frida执行完成或超时"
         
-    - name: Collect results
+    - name: Collect and display results
       run: |
-        # 提取hook结果
         echo "=== 收集Hook结果 ==="
         
-        # 检查是否捕获到数据
-        adb shell "ls -la /sdcard/*.txt" || echo "未找到结果文件"
+        # 检查文件
+        echo "SD卡文件列表:"
+        adb shell "ls -la /sdcard/*.txt 2>/dev/null" || echo "未找到txt文件"
         
         # 拉取结果文件
-        adb pull /sdcard/encrypted_license.txt ./ || echo "未找到license文件"
-        adb pull /sdcard/encrypted_key.txt ./ || echo "未找到key文件"
+        echo "拉取结果文件..."
+        adb pull /sdcard/encrypted_license.txt ./captured_license.txt 2>/dev/null || echo "未找到license文件"
+        adb pull /sdcard/encrypted_key.txt ./captured_key.txt 2>/dev/null || echo "未找到key文件"
         
         # 显示结果
-        if [ -f "encrypted_license.txt" ]; then
-          echo "=== EncryptedSqlCipherLicense ==="
-          cat encrypted_license.txt
+        echo "=== 捕获结果 ==="
+        if [ -f "captured_license.txt" ]; then
+          echo "✅ EncryptedSqlCipherLicense:"
+          cat captured_license.txt
+          echo ""
+        else
+          echo "❌ 未捕获到EncryptedSqlCipherLicense"
         fi
         
-        if [ -f "encrypted_key.txt" ]; then
-          echo "=== EncryptedSqlCipherKey ==="
-          cat encrypted_key.txt
+        if [ -f "captured_key.txt" ]; then
+          echo "✅ EncryptedSqlCipherKey:"
+          cat captured_key.txt
+          echo ""
+        else
+          echo "❌ 未捕获到EncryptedSqlCipherKey"
         fi
         
-    - name: Upload results
-      uses: actions/upload-artifact@v3
+        # 创建总结文件
+        echo "BlueArchive Hook结果总结" > summary.txt
+        echo "运行时间: $(date)" >> summary.txt
+        echo "License捕获: $(if [ -f "captured_license.txt" ]; then echo "成功"; else echo "失败"; fi)" >> summary.txt
+        echo "Key捕获: $(if [ -f "captured_key.txt" ]; then echo "成功"; else echo "失败"; fi)" >> summary.txt
+        
+    - name: Upload results as artifact
+      uses: actions/upload-artifact@v4
       with:
-        name: hook-results
+        name: bluearchive-hook-results
         path: |
-          encrypted_license.txt
-          encrypted_key.txt
-        retention-days: 1
+          captured_license.txt
+          captured_key.txt
+          summary.txt
+        retention-days: 7
+        
+    - name: Final cleanup
+      run: |
+        echo "=== 工作流完成 ==="
+        echo "结果已保存为Artifact: bluearchive-hook-results"
+        echo "可以在Actions页面下载结果文件"
