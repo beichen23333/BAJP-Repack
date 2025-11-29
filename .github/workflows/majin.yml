@@ -1,0 +1,199 @@
+name: BlueArchive APK Hook
+
+on: 
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  hook-bluearchive:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Android environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          android-tools-adb \
+          wget \
+          unzip \
+          openjdk-11-jdk \
+          python3 \
+          python3-pip
+          
+        # 安装apks2apk工具
+        pip3 install apks2apk
+        
+    - name: Start Android emulator
+      run: |
+        # 下载并启动安卓模拟器
+        wget https://github.com/remote-android/redroid-actions/raw/master/start-redroid.sh
+        chmod +x start-redroid.sh
+        ./start-redroid.sh &
+        sleep 30
+        
+        # 检查设备连接
+        adb devices
+        adb wait-for-device
+        echo "模拟器启动完成"
+        
+    - name: Download and extract XAPK
+      run: |
+        # 下载Blue Archive XAPK文件
+        wget -O bluearchive.xapk "https://d.apkpure.com/b/XAPK/com.YostarJP.BlueArchive?nc=arm64-v8a&sv=24"
+        
+        # 解压XAPK文件
+        unzip -o bluearchive.xapk -d xapk_extracted
+        
+        # 查看文件结构
+        echo "=== XAPK文件结构 ==="
+        find xapk_extracted -type f -name "*.apk" | sort
+        
+        # 安装主APK和分割APK
+        echo "=== 开始安装APK文件 ==="
+        
+        # 先安装主APK
+        if [ -f "xapk_extracted/com.YostarJP.BlueArchive.xapk" ]; then
+          unzip -o xapk_extracted/com.YostarJP.BlueArchive.xapk -d final_extracted
+        else
+          cp -r xapk_extracted/ final_extracted/
+        fi
+        
+        # 安装所有APK文件
+        for apk in final_extracted/*.apk; do
+          if [ -f "$apk" ]; then
+            echo "安装: $apk"
+            adb install -r "$apk"
+          fi
+        done
+        
+        # 检查安装结果
+        adb shell pm list packages | grep yostarjp
+        
+    - name: Setup Frida server
+      run: |
+        # 下载并安装frida-server
+        wget -q https://github.com/frida/frida/releases/download/16.1.8/frida-server-16.1.8-android-x86_64.xz
+        unxz frida-server-16.1.8-android-x86_64.xz
+        adb push frida-server-16.1.8-android-x86_64 /data/local/tmp/frida-server
+        adb shell "chmod 755 /data/local/tmp/frida-server"
+        adb shell "nohup /data/local/tmp/frida-server > /dev/null 2>&1 &"
+        
+        # 检查frida是否运行
+        sleep 5
+        adb shell "ps | grep frida-server"
+        
+    - name: Create hook script
+      run: |
+        cat > hook_bluearchive.js << 'EOF'
+        console.log("[+] Blue Archive Hook脚本加载完成");
+
+        // 等待游戏加载
+        setTimeout(function() {
+            Java.perform(function() {
+                console.log("[+] 开始Hook目标类...");
+                
+                try {
+                    // Hook QueuingGetCryptoKeysResponse类
+                    var targetClass = Java.use("MX.NetworkProtocol.QueuingGetCryptoKeysResponse");
+                    console.log("[+] 找到目标类: MX.NetworkProtocol.QueuingGetCryptoKeysResponse");
+                    
+                    // Hook EncryptedSqlCipherLicense setter
+                    targetClass.set_EncryptedSqlCipherLicense.implementation = function(value) {
+                        console.log("\n=== HOOK EncryptedSqlCipherLicense ===");
+                        console.log("值: " + value);
+                        console.log("长度: " + (value ? value.length : 0));
+                        
+                        // 保存到文件
+                        var file = new File("/sdcard/encrypted_license.txt", "w");
+                        file.write(value);
+                        file.flush();
+                        file.close();
+                        
+                        return this.set_EncryptedSqlCipherLicense(value);
+                    };
+                    
+                    // Hook EncryptedSqlCipherKey setter
+                    targetClass.set_EncryptedSqlCipherKey.implementation = function(value) {
+                        console.log("\n=== HOOK EncryptedSqlCipherKey ===");
+                        console.log("值: " + value);
+                        console.log("长度: " + (value ? value.length : 0));
+                        
+                        // 保存到文件
+                        var file = new File("/sdcard/encrypted_key.txt", "w");
+                        file.write(value);
+                        file.flush();
+                        file.close();
+                        
+                        return this.set_EncryptedSqlCipherKey(value);
+                    };
+                    
+                    // 也hook getter方法
+                    targetClass.get_EncryptedSqlCipherLicense.implementation = function() {
+                        var result = this.get_EncryptedSqlCipherLicense();
+                        console.log("[GET] EncryptedSqlCipherLicense被读取");
+                        return result;
+                    };
+                    
+                    targetClass.get_EncryptedSqlCipherKey.implementation = function() {
+                        var result = this.get_EncryptedSqlCipherKey();
+                        console.log("[GET] EncryptedSqlCipherKey被读取");
+                        return result;
+                    };
+                    
+                    console.log("[+] Hook设置完成，等待游戏触发...");
+                    
+                } catch (e) {
+                    console.log("[-] Hook错误: " + e);
+                }
+            });
+        }, 10000); // 等待10秒让游戏加载
+        EOF
+        
+    - name: Start game and run hook
+      run: |
+        # 启动游戏
+        echo "启动游戏..."
+        adb shell am start -n com.yostarjp.bluearchive/com.yostarjp.bluearchive.MxUnityPlayerActivity
+        
+        # 等待游戏启动
+        sleep 15
+        
+        # 运行Frida hook
+        echo "启动Frida Hook..."
+        timeout 300 frida -U -l hook_bluearchive.js -f com.yostarjp.bluearchive --no-pause || echo "Frida执行完成或超时"
+        
+    - name: Collect results
+      run: |
+        # 提取hook结果
+        echo "=== 收集Hook结果 ==="
+        
+        # 检查是否捕获到数据
+        adb shell "ls -la /sdcard/*.txt" || echo "未找到结果文件"
+        
+        # 拉取结果文件
+        adb pull /sdcard/encrypted_license.txt ./ || echo "未找到license文件"
+        adb pull /sdcard/encrypted_key.txt ./ || echo "未找到key文件"
+        
+        # 显示结果
+        if [ -f "encrypted_license.txt" ]; then
+          echo "=== EncryptedSqlCipherLicense ==="
+          cat encrypted_license.txt
+        fi
+        
+        if [ -f "encrypted_key.txt" ]; then
+          echo "=== EncryptedSqlCipherKey ==="
+          cat encrypted_key.txt
+        fi
+        
+    - name: Upload results
+      uses: actions/upload-artifact@v3
+      with:
+        name: hook-results
+        path: |
+          encrypted_license.txt
+          encrypted_key.txt
+        retention-days: 1
