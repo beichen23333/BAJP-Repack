@@ -27,6 +27,7 @@ jobs:
     - name: Install Python dependencies
       run: |
         pip3 install requests
+        pip3 install UnityPy
         
     - name: Extract XAPK using your script
       run: |
