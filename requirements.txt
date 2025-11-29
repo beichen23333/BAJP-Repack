@@ -1,3 +1,4 @@
 google-genai
 frida-tools
 apks2apk
+UnityPy
